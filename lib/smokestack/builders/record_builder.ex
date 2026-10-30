@@ -8,10 +8,13 @@ defmodule Smokestack.RecordBuilder do
   alias Spark.Options
   @behaviour Builder
 
-  @type option :: load_option | ManyBuilder.option() | RelatedBuilder.option()
+  @type option :: load_option | tenant_option | ManyBuilder.option() | RelatedBuilder.option()
 
   @typedoc "A nested keyword list of associations, calculations and aggregates to load"
   @type load_option :: {:load, Smokestack.recursive_atom_list()}
+
+  @typedoc "The tenant to seed the record into"
+  @type tenant_option :: {:tenant, term()}
 
   @type result :: Resource.record() | [Resource.record()]
   @type error ::
@@ -25,8 +28,9 @@ defmodule Smokestack.RecordBuilder do
   @impl true
   @spec build(Factory.t(), [option]) :: {:ok, result} | {:error, error}
   def build(factory, options) do
+    {tenant, options} = Keyword.pop(options, :tenant)
     {count, options} = Keyword.pop(options, :count)
-    do_build(factory, options, count)
+    do_build(factory, options, count, tenant)
   end
 
   @doc false
@@ -68,6 +72,17 @@ defmodule Smokestack.RecordBuilder do
 
       schema =
         [
+          tenant: [
+            type: :any,
+            required: false,
+            doc: """
+            The tenant to seed the record into.
+
+            For example:
+
+                insert!(Post, tenant: "my-tenant")
+            """
+          ],
           load: [
             type: load_type,
             required: false,
@@ -94,33 +109,33 @@ defmodule Smokestack.RecordBuilder do
     end
   end
 
-  defp do_build(factory, options, count) when is_integer(count) and count > 0 do
+  defp do_build(factory, options, count, tenant) when is_integer(count) and count > 0 do
     {load, options} = Keyword.pop(options, :load, [])
     options = Keyword.put(options, :count, count)
 
     with {:ok, attr_list} <- ManyBuilder.build(factory, options),
-         {:ok, record_list} <- seed(attr_list, factory) do
+         {:ok, record_list} <- seed(attr_list, factory, tenant) do
       record_list
       |> maybe_hook(factory)
-      |> maybe_load(factory, List.wrap(load))
+      |> maybe_load(factory, List.wrap(load), tenant)
     end
   end
 
-  defp do_build(factory, options, _count) do
+  defp do_build(factory, options, _count, tenant) do
     {load, options} = Keyword.pop(options, :load, [])
 
     with {:ok, attrs} <- RelatedBuilder.build(factory, options),
-         {:ok, record} <- seed(attrs, factory) do
+         {:ok, record} <- seed(attrs, factory, tenant) do
       record
       |> maybe_hook(factory)
-      |> maybe_load(factory, List.wrap(load))
+      |> maybe_load(factory, List.wrap(load), tenant)
     end
   end
 
-  defp seed(attr_list, factory) when is_list(attr_list) do
+  defp seed(attr_list, factory, tenant) when is_list(attr_list) do
     records =
       factory.resource
-      |> Seed.seed!(attr_list)
+      |> Seed.seed!(attr_list, seed_options(tenant))
       |> Enum.map(&set_meta(&1, factory))
 
     {:ok, records}
@@ -128,10 +143,10 @@ defmodule Smokestack.RecordBuilder do
     error -> {:error, error}
   end
 
-  defp seed(attrs, factory) do
+  defp seed(attrs, factory, tenant) do
     record =
       factory.resource
-      |> Seed.seed!(attrs)
+      |> Seed.seed!(attrs, seed_options(tenant))
       |> set_meta(factory)
 
     {:ok, record}
@@ -139,23 +154,31 @@ defmodule Smokestack.RecordBuilder do
     error -> {:error, error}
   end
 
+  defp seed_options(nil), do: []
+  defp seed_options(tenant), do: [tenant: tenant]
+
   defp set_meta(record, factory) do
     record
     |> Resource.put_metadata(:factory, factory.module)
     |> Resource.put_metadata(:variant, factory.variant)
   end
 
-  defp maybe_load(record_or_records, %{auto_load: []}, []), do: {:ok, record_or_records}
+  defp maybe_load(record_or_records, %{auto_load: []}, [], _tenant),
+    do: {:ok, record_or_records}
 
-  defp maybe_load(_record_or_records, factory, _load) when is_nil(factory.domain),
+  defp maybe_load(_record_or_records, factory, _load, _tenant) when is_nil(factory.domain),
     do: {:error, "Unable to perform `load` operation without an Domain."}
 
-  defp maybe_load(record_or_records, factory, load) do
+  defp maybe_load(record_or_records, factory, load, tenant) do
     load =
       factory.auto_load
       |> Enum.concat(load)
 
-    Ash.load(record_or_records, load, domain: factory.domain)
+    opts =
+      [domain: factory.domain]
+      |> then(fn opts -> if tenant, do: Keyword.put(opts, :tenant, tenant), else: opts end)
+
+    Ash.load(record_or_records, load, opts)
   end
 
   defp maybe_hook(records, factory) when is_list(records) do
